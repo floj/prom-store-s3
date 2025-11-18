@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,12 +21,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/prometheus/prometheus/prompb"
 )
 
 type S3Store struct {
-	client *s3.Client
-	bucket string
+	client          *s3.Client
+	bucket          string
+	retentionPeriod time.Duration
 }
 
 type Sample struct {
@@ -34,7 +37,7 @@ type Sample struct {
 	value     float64
 }
 
-func NewS3Store(bucket, region string) (*S3Store, error) {
+func NewS3Store(bucket, region string, retentionPeriod time.Duration) (*S3Store, error) {
 	cfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion(region),
 	)
@@ -45,8 +48,9 @@ func NewS3Store(bucket, region string) (*S3Store, error) {
 	client := s3.NewFromConfig(cfg)
 
 	return &S3Store{
-		client: client,
-		bucket: bucket,
+		client:          client,
+		bucket:          bucket,
+		retentionPeriod: retentionPeriod,
 	}, nil
 }
 
@@ -342,6 +346,114 @@ func matchesLabels(labels map[string]string, matchers map[string]*prompb.LabelMa
 		}
 	}
 	return true
+}
+
+// StartRetentionCleanup starts a background goroutine that periodically cleans up old data
+func (s *S3Store) StartRetentionCleanup(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour) // Run cleanup every hour
+	defer ticker.Stop()
+
+	log.Printf("Starting retention cleanup with period: %v", s.retentionPeriod)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Stopping retention cleanup")
+			return
+		case <-ticker.C:
+			if err := s.cleanupOldData(ctx); err != nil {
+				log.Printf("Error during retention cleanup: %v", err)
+			}
+		}
+	}
+}
+
+// cleanupOldData removes data older than the retention period
+func (s *S3Store) cleanupOldData(ctx context.Context) error {
+	cutoffTime := time.Now().Add(-s.retentionPeriod)
+	log.Printf("Cleaning up data older than %v", cutoffTime)
+
+	// List all objects in the metrics prefix
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String("metrics/"),
+	})
+
+	var objectsToDelete []string
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			// Parse timestamp from key
+			// Key format: metrics/{metric_name}/{year}{month}{day}{hour}{minute}{second}_{timestamp}.parquet
+			parts := strings.Split(*obj.Key, "/")
+			if len(parts) < 3 {
+				continue // Skip malformed keys
+			}
+
+			// Extract the date and timestamp part
+			datePart := strings.TrimSuffix(parts[2], ".parquet")
+			if idx := strings.LastIndex(datePart, "_"); idx != -1 {
+				timestampStr := datePart[idx+1:]
+				dateStr := datePart[:idx]
+
+				// Parse the date part (should be YYYY/MM/DD/HH/MM/SS)
+				if t, err := time.Parse("2006/01/02/15/04/05", dateStr); err == nil {
+					timestamp := t
+
+					// Try to parse millisecond timestamp if available
+					if ts, err := strconv.ParseInt(timestampStr, 10, 64); err == nil {
+						timestamp = time.UnixMilli(ts)
+					}
+
+					if timestamp.Before(cutoffTime) {
+						objectsToDelete = append(objectsToDelete, *obj.Key)
+					}
+				}
+			}
+		}
+	}
+
+	// Delete objects in batches
+	const batchSize = 1000
+	for i := 0; i < len(objectsToDelete); i += batchSize {
+		end := i + batchSize
+		if end > len(objectsToDelete) {
+			end = len(objectsToDelete)
+		}
+
+		batch := objectsToDelete[i:end]
+		if err := s.deleteObjectsBatch(ctx, batch); err != nil {
+			return fmt.Errorf("failed to delete batch: %w", err)
+		}
+	}
+
+	if len(objectsToDelete) > 0 {
+		log.Printf("Deleted %d old objects", len(objectsToDelete))
+	}
+
+	return nil
+}
+
+// deleteObjectsBatch deletes a batch of objects from S3
+func (s *S3Store) deleteObjectsBatch(ctx context.Context, keys []string) error {
+	objects := make([]types.ObjectIdentifier, len(keys))
+	for i, key := range keys {
+		objects[i] = types.ObjectIdentifier{Key: aws.String(key)}
+	}
+
+	_, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String(s.bucket),
+		Delete: &types.Delete{
+			Objects: objects,
+		},
+	})
+
+	return err
 }
 
 // writeMetricBatch writes a batch of samples for a single metric to S3

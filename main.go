@@ -7,14 +7,26 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
+	"time"
 )
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
 
 func main() {
 	var (
-		listenAddr = flag.String("listen-address", ":9201", "Address to listen on for HTTP requests")
-		s3Bucket   = flag.String("s3-bucket", os.Getenv("S3_BUCKET"), "S3 bucket name")
-		s3Region   = flag.String("s3-region", os.Getenv("AWS_REGION"), "AWS region")
+		listenAddr    = flag.String("listen-address", ":9201", "Address to listen on for HTTP requests")
+		s3Bucket      = flag.String("s3-bucket", os.Getenv("S3_BUCKET"), "S3 bucket name")
+		s3Region      = flag.String("s3-region", os.Getenv("AWS_REGION"), "AWS region")
+		retentionDays = flag.Int("retention-days", getEnvInt("RETENTION_DAYS", 7), "Data retention period in days (default 7)")
 	)
 	flag.Parse()
 
@@ -25,10 +37,13 @@ func main() {
 		*s3Region = "us-east-1"
 	}
 
-	store, err := NewS3Store(*s3Bucket, *s3Region)
+	store, err := NewS3Store(*s3Bucket, *s3Region, time.Duration(*retentionDays*24)*time.Hour)
 	if err != nil {
 		log.Fatalf("Failed to create S3 store: %v", err)
 	}
+
+	// Start retention cleanup goroutine
+	go store.StartRetentionCleanup(context.Background())
 
 	handler := NewHandler(store)
 

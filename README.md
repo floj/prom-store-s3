@@ -28,11 +28,12 @@ go build -o prom-store-s3
 
 ```bash
 # Using command-line flags
-./prom-store-s3 -s3-bucket=my-prometheus-bucket -s3-region=us-east-1 -listen-address=:9201
+./prom-store-s3 -s3-bucket=my-prometheus-bucket -s3-region=us-east-1 -listen-address=:9201 -retention-days=7
 
 # Using environment variables
 export S3_BUCKET=my-prometheus-bucket
 export AWS_REGION=us-east-1
+export RETENTION_DAYS=7
 ./prom-store-s3
 ```
 
@@ -41,6 +42,7 @@ export AWS_REGION=us-east-1
 - `-listen-address`: HTTP listen address (default: `:9201`)
 - `-s3-bucket`: S3 bucket name (required, can also use `S3_BUCKET` env var)
 - `-s3-region`: AWS region (default: `us-east-1`, can also use `AWS_REGION` env var)
+- `-retention-days`: Data retention period in days (default: `7`, can also use `RETENTION_DAYS` env var)
 
 ### AWS Credentials
 
@@ -101,12 +103,12 @@ go run .
 This is a basic implementation suitable for learning and small-scale deployments. For production use, consider:
 
 - Adding indexing for faster queries
-- Implementing batch writes
+- Implementing batch writes (partially implemented)
 - Adding caching
-- Implementing retention policies
-- Adding authentication/authorization
-- Using compression for stored data
 - Implementing more sophisticated query optimization
+- Adding authentication/authorization
+- Using compression for stored data (data is stored in Parquet format)
+- Implementing retention policies (implemented with configurable retention period)
 
 ## License
 
