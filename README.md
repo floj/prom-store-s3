@@ -5,6 +5,10 @@
 > ### ✨ **This project is vibe-coded!**
 > 
 > Expect creative solutions, experimental features, and a focus on vibes over rigorous production standards. Built with AI assistance and good energy! 🎨
+>
+> ### ⚠️ **Untested & Experimental**
+>
+> This project is **not tested** and is **not ready for production use**. Use at your own risk for experimentation and learning purposes only.
 
 ---
 
