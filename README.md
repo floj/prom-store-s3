@@ -147,6 +147,56 @@ go build
 go run .
 ```
 
+## Comparison with Other Solutions 🔍
+
+### vs. Thanos
+
+**[Thanos](https://github.com/thanos-io/thanos)** is a production-grade CNCF project designed for highly available Prometheus with long-term storage. Key differences:
+
+| Feature | This Project | Thanos |
+|---------|-------------|---------|
+| **Maturity** | 🧪 Experimental, vibe-coded | ✅ Production-ready, CNCF Incubating |
+| **Architecture** | Simple remote write/read adapter | Multi-component system (Sidecar, Store, Query, Compactor, etc.) |
+| **Storage** | Direct S3 parquet files | Prometheus TSDB blocks + object storage |
+| **HA Setup** | Single process (no HA) | Full HA with query deduplication |
+| **Global View** | Single Prometheus instance | Unified view across multiple Prometheus servers |
+| **Downsampling** | None | Automatic downsampling for historical data |
+| **Query Performance** | Basic manifest-based filtering | Optimized with Store Gateway, caching, sharding |
+| **Operational Complexity** | Very low (single binary) | Higher (multiple components to deploy) |
+| **Use Case** | Learning, experimentation | Large-scale production deployments |
+
+### vs. Cortex
+
+**[Cortex](https://github.com/cortexproject/cortex)** is a horizontally scalable, multi-tenant, long-term Prometheus storage system. Key differences:
+
+| Feature | This Project | Cortex |
+|---------|-------------|--------|
+| **Maturity** | 🧪 Experimental, vibe-coded | ✅ Production-ready, CNCF project |
+| **Multi-tenancy** | None | Built-in with tenant isolation |
+| **Scalability** | Single process | Horizontally scalable (distributors, ingesters, queriers) |
+| **Storage** | Direct S3 parquet | Blocks storage (S3, GCS, Azure, Swift) |
+| **Write Path** | Simple HTTP endpoint | Distributed ingestion with replication |
+| **Query Path** | Single process | Distributed query execution with caching |
+| **High Availability** | None | Built-in replication and redundancy |
+| **Data Format** | Parquet | Prometheus TSDB format |
+| **Operational Complexity** | Very low | High (many microservices) |
+| **Managed Service** | None | AWS Managed Prometheus (AMP) available |
+| **Use Case** | Toy projects, learning | Enterprise multi-tenant environments |
+
+### When to Use This Project
+
+Choose **prom-store-s3** if you want to:
+- 🎓 Learn about Prometheus remote storage protocols
+- 🧪 Experiment with Parquet and S3-based metric storage
+- 🚀 Build a simple proof-of-concept quickly
+- 💡 Understand the basics before diving into production systems
+
+Choose **Thanos** or **Cortex** if you need:
+- 📈 Production-grade reliability and support
+- 🏢 Multi-tenant or multi-cluster environments
+- ⚡ High availability and horizontal scaling
+- 🔧 Enterprise features and operational tooling
+
 ## Limitations & Next Steps 🚧
 
 This implementation is suitable for experimentation and small-scale use. For production consider:
