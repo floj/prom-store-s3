@@ -1,0 +1,20 @@
+# Example Prometheus configuration
+# Add this to your prometheus.yml file
+
+# Remote write configuration
+remote_write:
+  - url: "http://localhost:9201/write"
+    # Optional: Add queue configuration for better performance
+    queue_config:
+      capacity: 10000
+      max_shards: 10
+      min_shards: 1
+      max_samples_per_send: 1000
+      batch_send_deadline: 5s
+      min_backoff: 30ms
+      max_backoff: 100ms
+
+# Remote read configuration
+remote_read:
+  - url: "http://localhost:9201/read"
+    read_recent: true
