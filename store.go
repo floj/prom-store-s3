@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -36,6 +37,14 @@ type Sample struct {
 	labels    map[string]string
 	timestamp int64
 	value     float64
+}
+
+// ManifestEntry stores min/max timestamp metadata for a parquet object
+type ManifestEntry struct {
+	Key     string `json:"key"`
+	MinTs   int64  `json:"min_ts"`
+	MaxTs   int64  `json:"max_ts"`
+	Samples int    `json:"samples"`
 }
 
 func NewS3Store(bucket, region string, retentionPeriod time.Duration) (*S3Store, error) {
@@ -147,124 +156,103 @@ func (s *S3Store) executeQuery(ctx context.Context, query *prompb.Query) (*promp
 		}, nil
 	}
 
-	// List objects with the metric prefix
+	// Metric prefix and manifest key
 	prefix := fmt.Sprintf("metrics/%s/", sanitizeMetricName(metricName))
+	manifestKey := fmt.Sprintf("metrics/%s/manifest.ndjson", sanitizeMetricName(metricName))
 
 	// Use time range to narrow down the search
 	startTime := time.UnixMilli(query.StartTimestampMs)
 	endTime := time.UnixMilli(query.EndTimestampMs)
-
 	var timeseries []*prompb.TimeSeries
 	timeseriesMap := make(map[string]*prompb.TimeSeries)
+	// Attempt to use manifest to select candidate object keys
+	candidateKeys, usedManifest := s.loadManifestKeys(ctx, manifestKey, query.StartTimestampMs, query.EndTimestampMs)
 
-	// List objects in time range subdirectories
-	// This is a simplified approach - in production, you'd want more sophisticated indexing
-	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.bucket),
-		Prefix: aws.String(prefix),
-	})
+	if !usedManifest {
+		// Fallback: list objects with prefix (legacy path)
+		paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.bucket),
+			Prefix: aws.String(prefix),
+		})
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+			}
+			for _, obj := range page.Contents {
+				candidateKeys = append(candidateKeys, *obj.Key)
+			}
+		}
+	}
 
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+	for _, objectKey := range candidateKeys {
+		result, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(objectKey),
+		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+			log.Printf("Error getting object %s: %v", objectKey, err)
+			continue
 		}
 
-		for _, obj := range page.Contents {
-			// Get the object
-			result, err := s.client.GetObject(ctx, &s3.GetObjectInput{
-				Bucket: aws.String(s.bucket),
-				Key:    obj.Key,
-			})
-			if err != nil {
-				log.Printf("Error getting object %s: %v", *obj.Key, err)
-				continue
-			}
+		data, err := io.ReadAll(result.Body)
+		result.Body.Close()
+		if err != nil {
+			log.Printf("Error reading object %s: %v", objectKey, err)
+			continue
+		}
 
-			// Read Parquet file from S3
-			data, err := io.ReadAll(result.Body)
-			result.Body.Close()
-			if err != nil {
-				log.Printf("Error reading object %s: %v", *obj.Key, err)
-				continue
-			}
+		parquetReader, err := file.NewParquetReader(bytes.NewReader(data), file.WithReadProps(parquet.NewReaderProperties(memory.DefaultAllocator)))
+		if err != nil {
+			log.Printf("Error creating parquet reader for %s: %v", objectKey, err)
+			continue
+		}
 
-			// Parse Parquet file
-			parquetReader, err := file.NewParquetReader(bytes.NewReader(data), file.WithReadProps(parquet.NewReaderProperties(memory.DefaultAllocator)))
-			if err != nil {
-				log.Printf("Error creating parquet reader for %s: %v", *obj.Key, err)
-				continue
-			}
+		fileReader, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+		if err != nil {
+			log.Printf("Error creating arrow file reader for %s: %v", objectKey, err)
+			continue
+		}
 
-			fileReader, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
-			if err != nil {
-				log.Printf("Error creating arrow file reader for %s: %v", *obj.Key, err)
-				continue
-			}
+		table, err := fileReader.ReadTable(ctx)
+		if err != nil {
+			log.Printf("Error reading parquet table from %s: %v", objectKey, err)
+			continue
+		}
+		defer table.Release()
 
-			table, err := fileReader.ReadTable(ctx)
-			if err != nil {
-				log.Printf("Error reading parquet table from %s: %v", *obj.Key, err)
-				continue
-			}
-			defer table.Release()
+		tr := array.NewTableReader(table, 0)
+		defer tr.Release()
 
-			// Process records
-			tr := array.NewTableReader(table, 0)
-			defer tr.Release()
-
-			for tr.Next() {
-				rec := tr.Record()
-
-				timestampCol := rec.Column(0).(*array.Int64)
-				valueCol := rec.Column(1).(*array.Float64)
-				labelsCol := rec.Column(2).(*array.String)
-
-				for i := 0; i < int(rec.NumRows()); i++ {
-					timestamp := timestampCol.Value(i)
-					value := valueCol.Value(i)
-					labelsStr := labelsCol.Value(i)
-
-					// Filter by time range
-					if timestamp < query.StartTimestampMs || timestamp > query.EndTimestampMs {
-						continue
-					}
-
-					// Parse labels from string
-					labels := stringToLabelsMap(labelsStr)
-
-					// Filter by label matchers
-					if !matchesLabels(labels, labelMatchers) {
-						continue
-					}
-
-					// Convert labels back to prompb format
-					pbLabels := make([]prompb.Label, 0, len(labels))
-					labelKey := ""
-					for name, val := range labels {
-						pbLabels = append(pbLabels, prompb.Label{
-							Name:  name,
-							Value: val,
-						})
-						labelKey += name + "=" + val + ","
-					}
-
-					// Group samples by label set
-					ts, exists := timeseriesMap[labelKey]
-					if !exists {
-						ts = &prompb.TimeSeries{
-							Labels:  pbLabels,
-							Samples: []prompb.Sample{},
-						}
-						timeseriesMap[labelKey] = ts
-						timeseries = append(timeseries, ts)
-					}
-
-					ts.Samples = append(ts.Samples, prompb.Sample{
-						Timestamp: timestamp,
-						Value:     value,
-					})
+		for tr.Next() {
+			rec := tr.Record()
+			timestampCol := rec.Column(0).(*array.Int64)
+			valueCol := rec.Column(1).(*array.Float64)
+			labelsCol := rec.Column(2).(*array.String)
+			for i := 0; i < int(rec.NumRows()); i++ {
+				tsVal := timestampCol.Value(i)
+				if tsVal < query.StartTimestampMs || tsVal > query.EndTimestampMs {
+					continue
 				}
+				val := valueCol.Value(i)
+				labelsStr := labelsCol.Value(i)
+				labels := stringToLabelsMap(labelsStr)
+				if !matchesLabels(labels, labelMatchers) {
+					continue
+				}
+				pbLabels := make([]prompb.Label, 0, len(labels))
+				labelKey := ""
+				for name, v := range labels {
+					pbLabels = append(pbLabels, prompb.Label{Name: name, Value: v})
+					labelKey += name + "=" + v + ","
+				}
+				series, ok := timeseriesMap[labelKey]
+				if !ok {
+					series = &prompb.TimeSeries{Labels: pbLabels, Samples: []prompb.Sample{}}
+					timeseriesMap[labelKey] = series
+					timeseries = append(timeseries, series)
+				}
+				series.Samples = append(series.Samples, prompb.Sample{Timestamp: tsVal, Value: val})
 			}
 		}
 	}
@@ -511,5 +499,67 @@ func (s *S3Store) writeMetricBatch(ctx context.Context, metricName string, sampl
 		return fmt.Errorf("failed to write batch for metric %s to S3: %w", metricName, err)
 	}
 
+	// Update manifest with min/max timestamps
+	minTs, maxTs := samples[0].timestamp, samples[0].timestamp
+	for _, s := range samples[1:] {
+		if s.timestamp < minTs {
+			minTs = s.timestamp
+		}
+		if s.timestamp > maxTs {
+			maxTs = s.timestamp
+		}
+	}
+	entry := ManifestEntry{Key: key, MinTs: minTs, MaxTs: maxTs, Samples: len(samples)}
+	if err := s.appendManifestEntry(ctx, metricName, entry); err != nil {
+		log.Printf("Warning: failed updating manifest for %s: %v", metricName, err)
+	}
+
 	return nil
+}
+
+// appendManifestEntry appends a manifest entry (naive read-modify-write; race prone under high concurrency)
+func (s *S3Store) appendManifestEntry(ctx context.Context, metricName string, entry ManifestEntry) error {
+	manifestKey := fmt.Sprintf("metrics/%s/manifest.ndjson", sanitizeMetricName(metricName))
+	// Get existing manifest (if any)
+	existing, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(manifestKey)})
+	var buf bytes.Buffer
+	if err == nil {
+		io.Copy(&buf, existing.Body)
+		existing.Body.Close()
+	}
+	line, _ := json.Marshal(entry)
+	buf.Write(line)
+	buf.WriteByte('\n')
+	_, putErr := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(manifestKey),
+		Body:   bytes.NewReader(buf.Bytes()),
+	})
+	return putErr
+}
+
+// loadManifestKeys returns candidate object keys filtered by time range using manifest; bool indicates if manifest used
+func (s *S3Store) loadManifestKeys(ctx context.Context, manifestKey string, startMs, endMs int64) ([]string, bool) {
+	resp, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(manifestKey)})
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	var keys []string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		var e ManifestEntry
+		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
+			continue
+		}
+		// Time window overlap check
+		if e.MaxTs < startMs || e.MinTs > endMs {
+			continue
+		}
+		keys = append(keys, e.Key)
+	}
+	if err := scanner.Err(); err != nil {
+		return keys, true // partial
+	}
+	return keys, true
 }
