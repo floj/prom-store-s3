@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +28,8 @@ type S3Store struct {
 	client          *s3.Client
 	bucket          string
 	retentionPeriod time.Duration
+	retentionCancel context.CancelFunc
+	retentionWG     sync.WaitGroup
 }
 
 type Sample struct {
@@ -349,31 +350,44 @@ func matchesLabels(labels map[string]string, matchers map[string]*prompb.LabelMa
 }
 
 // StartRetentionCleanup starts a background goroutine that periodically cleans up old data
-func (s *S3Store) StartRetentionCleanup(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Hour) // Run cleanup every hour
-	defer ticker.Stop()
-
-	log.Printf("Starting retention cleanup with period: %v", s.retentionPeriod)
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Stopping retention cleanup")
-			return
-		case <-ticker.C:
-			if err := s.cleanupOldData(ctx); err != nil {
-				log.Printf("Error during retention cleanup: %v", err)
+func (s *S3Store) StartRetentionCleanup() {
+	if s.retentionPeriod <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.retentionCancel = cancel
+	s.retentionWG.Add(1)
+	go func() {
+		defer s.retentionWG.Done()
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		log.Printf("Starting retention cleanup with period: %v", s.retentionPeriod)
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Stopping retention cleanup")
+				return
+			case <-ticker.C:
+				if err := s.cleanupOldData(ctx); err != nil {
+					log.Printf("Error during retention cleanup: %v", err)
+				}
 			}
 		}
+	}()
+}
+
+func (s *S3Store) Stop() {
+	if s.retentionCancel != nil {
+		s.retentionCancel()
 	}
+	s.retentionWG.Wait()
 }
 
 // cleanupOldData removes data older than the retention period
 func (s *S3Store) cleanupOldData(ctx context.Context) error {
 	cutoffTime := time.Now().Add(-s.retentionPeriod)
-	log.Printf("Cleaning up data older than %v", cutoffTime)
+	log.Printf("Cleaning up data older than %v (using S3 LastModified)", cutoffTime)
 
-	// List all objects in the metrics prefix
 	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket),
 		Prefix: aws.String("metrics/"),
@@ -388,54 +402,31 @@ func (s *S3Store) cleanupOldData(ctx context.Context) error {
 		}
 
 		for _, obj := range page.Contents {
-			// Parse timestamp from key
-			// Key format: metrics/{metric_name}/{year}{month}{day}{hour}{minute}{second}_{timestamp}.parquet
-			parts := strings.Split(*obj.Key, "/")
-			if len(parts) < 3 {
-				continue // Skip malformed keys
+			if obj.LastModified == nil {
+				continue
 			}
-
-			// Extract the date and timestamp part
-			datePart := strings.TrimSuffix(parts[2], ".parquet")
-			if idx := strings.LastIndex(datePart, "_"); idx != -1 {
-				timestampStr := datePart[idx+1:]
-				dateStr := datePart[:idx]
-
-				// Parse the date part (should be YYYY/MM/DD/HH/MM/SS)
-				if t, err := time.Parse("2006/01/02/15/04/05", dateStr); err == nil {
-					timestamp := t
-
-					// Try to parse millisecond timestamp if available
-					if ts, err := strconv.ParseInt(timestampStr, 10, 64); err == nil {
-						timestamp = time.UnixMilli(ts)
-					}
-
-					if timestamp.Before(cutoffTime) {
-						objectsToDelete = append(objectsToDelete, *obj.Key)
-					}
-				}
+			if obj.LastModified.Before(cutoffTime) {
+				objectsToDelete = append(objectsToDelete, *obj.Key)
 			}
 		}
 	}
 
-	// Delete objects in batches
+	if len(objectsToDelete) == 0 {
+		return nil
+	}
+
 	const batchSize = 1000
 	for i := 0; i < len(objectsToDelete); i += batchSize {
 		end := i + batchSize
 		if end > len(objectsToDelete) {
 			end = len(objectsToDelete)
 		}
-
-		batch := objectsToDelete[i:end]
-		if err := s.deleteObjectsBatch(ctx, batch); err != nil {
+		if err := s.deleteObjectsBatch(ctx, objectsToDelete[i:end]); err != nil {
 			return fmt.Errorf("failed to delete batch: %w", err)
 		}
 	}
 
-	if len(objectsToDelete) > 0 {
-		log.Printf("Deleted %d old objects", len(objectsToDelete))
-	}
-
+	log.Printf("Deleted %d old objects", len(objectsToDelete))
 	return nil
 }
 

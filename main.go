@@ -42,8 +42,8 @@ func main() {
 		log.Fatalf("Failed to create S3 store: %v", err)
 	}
 
-	// Start retention cleanup goroutine
-	go store.StartRetentionCleanup(context.Background())
+	// Start retention cleanup goroutine (managed internally)
+	store.StartRetentionCleanup()
 
 	handler := NewHandler(store)
 
@@ -67,7 +67,11 @@ func main() {
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
 		log.Println("Shutting down server...")
-		if err := server.Shutdown(context.Background()); err != nil {
+		// Stop background processes
+		store.Stop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("Server shutdown error: %v", err)
 		}
 	}()

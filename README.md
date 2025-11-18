@@ -98,17 +98,18 @@ go build
 go run .
 ```
 
-## Limitations
+## Limitations & Next Steps
 
-This is a basic implementation suitable for learning and small-scale deployments. For production use, consider:
+This implementation is suitable for experimentation and small-scale use. For production consider:
 
-- Adding indexing for faster queries
-- Implementing batch writes (partially implemented)
-- Adding caching
-- Implementing more sophisticated query optimization
-- Adding authentication/authorization
-- Using compression for stored data (data is stored in Parquet format)
-- Implementing retention policies (implemented with configurable retention period)
+- Indexing objects (e.g. manifest per metric) for faster remote read scans
+- Bounding parallel write goroutines (add a worker pool / semaphore)
+- Exposing Prometheus metrics (write/read latency, S3 ops, retention deletions)
+- Adding authentication / authorization (e.g. mTLS or reverse proxy integration)
+- Improved regex matcher support (full RE / NRE semantics)
+- Configurable Parquet row group / compression tuning
+- Pluggable storage class selection (STANDARD vs GLACIER tiers)
+- Retention currently uses S3 object LastModified; consider tagging + lifecycle rules for offloading work to S3
 
 ## License
 
