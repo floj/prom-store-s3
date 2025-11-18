@@ -43,6 +43,27 @@ export RETENTION_DAYS=7
 - `-s3-bucket`: S3 bucket name (required, can also use `S3_BUCKET` env var)
 - `-s3-region`: AWS region (default: `us-east-1`, can also use `AWS_REGION` env var)
 - `-retention-days`: Data retention period in days (default: `7`, can also use `RETENTION_DAYS` env var)
+- `-log-level`: Structured log level (`debug`, `info`, `warn`, `error`). Defaults to `info`. Can also use `LOG_LEVEL` env var.
+
+### Logging
+
+The application uses Go's standard library `slog` for structured JSON logging to stdout.
+
+Set log level via flag or environment variable:
+
+```bash
+./prom-store-s3 -log-level=debug ...
+
+export LOG_LEVEL=warn
+./prom-store-s3
+```
+
+Example log entry:
+```json
+{"time":"2025-11-18T12:00:00Z","level":"INFO","msg":"starting prometheus remote storage adapter","listen_address":":9201","s3_bucket":"my-prometheus-bucket","s3_region":"us-east-1","retention_days":7,"log_level":"INFO"}
+```
+
+All operations (writes, reads, retention cleanup, errors) emit structured fields for easier ingestion by log processors.
 
 ### AWS Credentials
 

@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +31,7 @@ type S3Store struct {
 	retentionPeriod time.Duration
 	retentionCancel context.CancelFunc
 	retentionWG     sync.WaitGroup
+	logger          *slog.Logger
 }
 
 type Sample struct {
@@ -47,7 +48,7 @@ type ManifestEntry struct {
 	Samples int    `json:"samples"`
 }
 
-func NewS3Store(bucket, region string, retentionPeriod time.Duration) (*S3Store, error) {
+func NewS3Store(bucket, region string, retentionPeriod time.Duration, logger *slog.Logger) (*S3Store, error) {
 	cfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion(region),
 	)
@@ -61,6 +62,7 @@ func NewS3Store(bucket, region string, retentionPeriod time.Duration) (*S3Store,
 		client:          client,
 		bucket:          bucket,
 		retentionPeriod: retentionPeriod,
+		logger:          logger,
 	}, nil
 }
 
@@ -124,11 +126,9 @@ func (s *S3Store) Read(ctx context.Context, req *prompb.ReadRequest) (*prompb.Re
 	for i, query := range req.Queries {
 		result, err := s.executeQuery(ctx, query)
 		if err != nil {
-			log.Printf("Error executing query: %v", err)
+			s.logger.Error("query execution failed", "error", err)
 			// Return empty result on error rather than failing completely
-			result = &prompb.QueryResult{
-				Timeseries: []*prompb.TimeSeries{},
-			}
+			result = &prompb.QueryResult{Timeseries: []*prompb.TimeSeries{}}
 		}
 		resp.Results[i] = result
 	}
@@ -191,32 +191,32 @@ func (s *S3Store) executeQuery(ctx context.Context, query *prompb.Query) (*promp
 			Key:    aws.String(objectKey),
 		})
 		if err != nil {
-			log.Printf("Error getting object %s: %v", objectKey, err)
+			s.logger.Error("get object failed", "key", objectKey, "error", err)
 			continue
 		}
 
 		data, err := io.ReadAll(result.Body)
 		result.Body.Close()
 		if err != nil {
-			log.Printf("Error reading object %s: %v", objectKey, err)
+			s.logger.Error("read object body failed", "key", objectKey, "error", err)
 			continue
 		}
 
 		parquetReader, err := file.NewParquetReader(bytes.NewReader(data), file.WithReadProps(parquet.NewReaderProperties(memory.DefaultAllocator)))
 		if err != nil {
-			log.Printf("Error creating parquet reader for %s: %v", objectKey, err)
+			s.logger.Error("parquet reader create failed", "key", objectKey, "error", err)
 			continue
 		}
 
 		fileReader, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
 		if err != nil {
-			log.Printf("Error creating arrow file reader for %s: %v", objectKey, err)
+			s.logger.Error("arrow file reader create failed", "key", objectKey, "error", err)
 			continue
 		}
 
 		table, err := fileReader.ReadTable(ctx)
 		if err != nil {
-			log.Printf("Error reading parquet table from %s: %v", objectKey, err)
+			s.logger.Error("read parquet table failed", "key", objectKey, "error", err)
 			continue
 		}
 		defer table.Release()
@@ -257,8 +257,7 @@ func (s *S3Store) executeQuery(ctx context.Context, query *prompb.Query) (*promp
 		}
 	}
 
-	log.Printf("Query for %s from %v to %v returned %d timeseries",
-		metricName, startTime, endTime, len(timeseries))
+	s.logger.Info("query result summary", "metric", metricName, "start", startTime, "end", endTime, "timeseries", len(timeseries))
 
 	return &prompb.QueryResult{
 		Timeseries: timeseries,
@@ -349,15 +348,15 @@ func (s *S3Store) StartRetentionCleanup() {
 		defer s.retentionWG.Done()
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
-		log.Printf("Starting retention cleanup with period: %v", s.retentionPeriod)
+		s.logger.Info("starting retention cleanup", "period", s.retentionPeriod)
 		for {
 			select {
 			case <-ctx.Done():
-				log.Println("Stopping retention cleanup")
+				s.logger.Info("stopping retention cleanup")
 				return
 			case <-ticker.C:
 				if err := s.cleanupOldData(ctx); err != nil {
-					log.Printf("Error during retention cleanup: %v", err)
+					s.logger.Error("retention cleanup error", "error", err)
 				}
 			}
 		}
@@ -374,7 +373,7 @@ func (s *S3Store) Stop() {
 // cleanupOldData removes data older than the retention period
 func (s *S3Store) cleanupOldData(ctx context.Context) error {
 	cutoffTime := time.Now().Add(-s.retentionPeriod)
-	log.Printf("Cleaning up data older than %v (using S3 LastModified)", cutoffTime)
+	s.logger.Info("retention cleanup scanning", "cutoff", cutoffTime)
 
 	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket),
@@ -414,7 +413,7 @@ func (s *S3Store) cleanupOldData(ctx context.Context) error {
 		}
 	}
 
-	log.Printf("Deleted %d old objects", len(objectsToDelete))
+	s.logger.Info("retention cleanup deleted objects", "count", len(objectsToDelete))
 	return nil
 }
 
@@ -511,7 +510,7 @@ func (s *S3Store) writeMetricBatch(ctx context.Context, metricName string, sampl
 	}
 	entry := ManifestEntry{Key: key, MinTs: minTs, MaxTs: maxTs, Samples: len(samples)}
 	if err := s.appendManifestEntry(ctx, metricName, entry); err != nil {
-		log.Printf("Warning: failed updating manifest for %s: %v", metricName, err)
+		s.logger.Warn("manifest update failed", "metric", metricName, "error", err)
 	}
 
 	return nil

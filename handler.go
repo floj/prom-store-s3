@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/gogo/protobuf/proto"
@@ -12,11 +12,12 @@ import (
 )
 
 type Handler struct {
-	store *S3Store
+	store  *S3Store
+	logger *slog.Logger
 }
 
-func NewHandler(store *S3Store) *Handler {
-	return &Handler{store: store}
+func NewHandler(store *S3Store, logger *slog.Logger) *Handler {
+	return &Handler{store: store, logger: logger}
 }
 
 func (h *Handler) Write(w http.ResponseWriter, r *http.Request) {
@@ -27,7 +28,7 @@ func (h *Handler) Write(w http.ResponseWriter, r *http.Request) {
 
 	compressed, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("Error reading request body: %v", err)
+		h.logger.Error("read request body failed", "error", err)
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
@@ -39,20 +40,20 @@ func (h *Handler) Write(w http.ResponseWriter, r *http.Request) {
 
 	reqBuf, err := snappy.Decode(nil, compressed)
 	if err != nil {
-		log.Printf("Error decompressing request: %v", err)
+		h.logger.Error("snappy decompress failed", "error", err)
 		http.Error(w, "Failed to decompress request", http.StatusBadRequest)
 		return
 	}
 
 	var req prompb.WriteRequest
 	if err := proto.Unmarshal(reqBuf, &req); err != nil {
-		log.Printf("Error unmarshaling request: %v", err)
+		h.logger.Error("unmarshal write request failed", "error", err)
 		http.Error(w, "Failed to unmarshal request", http.StatusBadRequest)
 		return
 	}
 
 	if len(req.Timeseries) == 0 {
-		log.Printf("Warning: received write request with no timeseries")
+		h.logger.Warn("empty write request")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -61,10 +62,10 @@ func (h *Handler) Write(w http.ResponseWriter, r *http.Request) {
 	for _, ts := range req.Timeseries {
 		totalSamples += len(ts.Samples)
 	}
-	log.Printf("Writing %d timeseries with total %d samples", len(req.Timeseries), totalSamples)
+	h.logger.Info("write request", "timeseries", len(req.Timeseries), "samples", totalSamples)
 
 	if err := h.store.Write(r.Context(), &req); err != nil {
-		log.Printf("Error writing to S3: %v", err)
+		h.logger.Error("write to storage failed", "error", err)
 		http.Error(w, "Failed to write to storage", http.StatusInternalServerError)
 		return
 	}
@@ -80,35 +81,35 @@ func (h *Handler) Read(w http.ResponseWriter, r *http.Request) {
 
 	compressed, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("Error reading request body: %v", err)
+		h.logger.Error("read request body failed", "error", err)
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
 
 	reqBuf, err := snappy.Decode(nil, compressed)
 	if err != nil {
-		log.Printf("Error decompressing request: %v", err)
+		h.logger.Error("snappy decompress failed", "error", err)
 		http.Error(w, "Failed to decompress request", http.StatusBadRequest)
 		return
 	}
 
 	var req prompb.ReadRequest
 	if err := proto.Unmarshal(reqBuf, &req); err != nil {
-		log.Printf("Error unmarshaling request: %v", err)
+		h.logger.Error("unmarshal read request failed", "error", err)
 		http.Error(w, "Failed to unmarshal request", http.StatusBadRequest)
 		return
 	}
 
 	resp, err := h.store.Read(r.Context(), &req)
 	if err != nil {
-		log.Printf("Error reading from S3: %v", err)
+		h.logger.Error("read from storage failed", "error", err)
 		http.Error(w, fmt.Sprintf("Failed to read from storage: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	data, err := proto.Marshal(resp)
 	if err != nil {
-		log.Printf("Error marshaling response: %v", err)
+		h.logger.Error("marshal response failed", "error", err)
 		http.Error(w, "Failed to marshal response", http.StatusInternalServerError)
 		return
 	}
@@ -119,6 +120,6 @@ func (h *Handler) Read(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Encoding", "snappy")
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(compressed); err != nil {
-		log.Printf("Error writing response: %v", err)
+		h.logger.Error("write response failed", "error", err)
 	}
 }
