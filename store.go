@@ -35,9 +35,12 @@ func NewS3Store(bucket, region string) (*S3Store, error) {
 	}, nil
 }
 
-// Write stores timeseries data in S3
-// Uses a key structure: metrics/{metric_name}/{timestamp}.json
+// Write stores timeseries data in S3, batching all samples for a given metric
+// name from a single WriteRequest into one S3 object.
 func (s *S3Store) Write(ctx context.Context, req *prompb.WriteRequest) error {
+	// Group samples by metric name
+	metrics := make(map[string][]map[string]interface{})
+
 	for _, ts := range req.Timeseries {
 		metricName := getMetricName(ts.Labels)
 		if metricName == "" {
@@ -45,36 +48,44 @@ func (s *S3Store) Write(ctx context.Context, req *prompb.WriteRequest) error {
 		}
 
 		for _, sample := range ts.Samples {
-			// Create a storage-friendly structure
 			data := map[string]interface{}{
 				"labels":    labelsToMap(ts.Labels),
 				"timestamp": sample.Timestamp,
 				"value":     sample.Value,
 			}
+			metrics[metricName] = append(metrics[metricName], data)
+		}
+	}
 
-			jsonData, err := json.Marshal(data)
-			if err != nil {
-				return fmt.Errorf("failed to marshal data: %w", err)
-			}
+	for metricName, samples := range metrics {
+		if len(samples) == 0 {
+			continue
+		}
 
-			// Store with key: metrics/{metric_name}/{timestamp}_{hash}.json
-			// Using timestamp as prefix for better organization and range queries
-			timestamp := time.UnixMilli(sample.Timestamp)
-			key := fmt.Sprintf("metrics/%s/%s_%d.json",
-				sanitizeMetricName(metricName),
-				timestamp.Format("2006/01/02/15/04"),
-				sample.Timestamp,
-			)
+		jsonData, err := json.Marshal(samples)
+		if err != nil {
+			return fmt.Errorf("failed to marshal data for metric %s: %w", metricName, err)
+		}
 
-			_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
-				Bucket:      aws.String(s.bucket),
-				Key:         aws.String(key),
-				Body:        strings.NewReader(string(jsonData)),
-				ContentType: aws.String("application/json"),
-			})
-			if err != nil {
-				return fmt.Errorf("failed to write to S3: %w", err)
-			}
+		// Use the timestamp of the first sample for the key.
+		// In a real-world scenario, you might want a more sophisticated naming scheme
+		// to avoid collisions and allow for efficient querying.
+		firstTimestamp := samples[0]["timestamp"].(int64)
+		timestamp := time.UnixMilli(firstTimestamp)
+		key := fmt.Sprintf("metrics/%s/%s_%d.json",
+			sanitizeMetricName(metricName),
+			timestamp.Format("2006/01/02/15/04/05"), // Added seconds for more granular files
+			firstTimestamp,
+		)
+
+		_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(s.bucket),
+			Key:         aws.String(key),
+			Body:        strings.NewReader(string(jsonData)),
+			ContentType: aws.String("application/json"),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to write batch for metric %s to S3: %w", metricName, err)
 		}
 	}
 
