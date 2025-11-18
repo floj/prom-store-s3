@@ -32,6 +32,8 @@ type S3Store struct {
 	retentionCancel context.CancelFunc
 	retentionWG     sync.WaitGroup
 	logger          *slog.Logger
+	mapMutex        sync.Mutex
+	manifestLocks   map[string]*sync.Mutex
 }
 
 type Sample struct {
@@ -63,6 +65,7 @@ func NewS3Store(bucket, region string, retentionPeriod time.Duration, logger *sl
 		bucket:          bucket,
 		retentionPeriod: retentionPeriod,
 		logger:          logger,
+		manifestLocks:   make(map[string]*sync.Mutex),
 	}, nil
 }
 
@@ -516,8 +519,19 @@ func (s *S3Store) writeMetricBatch(ctx context.Context, metricName string, sampl
 	return nil
 }
 
-// appendManifestEntry appends a manifest entry (naive read-modify-write; race prone under high concurrency)
+// appendManifestEntry appends a manifest entry, protecting against concurrent writes
 func (s *S3Store) appendManifestEntry(ctx context.Context, metricName string, entry ManifestEntry) error {
+	s.mapMutex.Lock()
+	mu, ok := s.manifestLocks[metricName]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.manifestLocks[metricName] = mu
+	}
+	s.mapMutex.Unlock()
+
+	mu.Lock()
+	defer mu.Unlock()
+
 	manifestKey := fmt.Sprintf("metrics/%s/manifest.ndjson", sanitizeMetricName(metricName))
 	// Get existing manifest (if any)
 	existing, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(manifestKey)})
