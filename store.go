@@ -1,13 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"time"
 
+	"github.com/apache/arrow/go/v18/arrow"
+	"github.com/apache/arrow/go/v18/arrow/array"
+	"github.com/apache/arrow/go/v18/arrow/memory"
+	"github.com/apache/arrow/go/v18/parquet"
+	"github.com/apache/arrow/go/v18/parquet/file"
+	"github.com/apache/arrow/go/v18/parquet/pqarrow"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -39,7 +47,12 @@ func NewS3Store(bucket, region string) (*S3Store, error) {
 // name from a single WriteRequest into one S3 object.
 func (s *S3Store) Write(ctx context.Context, req *prompb.WriteRequest) error {
 	// Group samples by metric name
-	metrics := make(map[string][]map[string]interface{})
+	type Sample struct {
+		labels    map[string]string
+		timestamp int64
+		value     float64
+	}
+	metrics := make(map[string][]Sample)
 
 	for _, ts := range req.Timeseries {
 		metricName := getMetricName(ts.Labels)
@@ -48,10 +61,10 @@ func (s *S3Store) Write(ctx context.Context, req *prompb.WriteRequest) error {
 		}
 
 		for _, sample := range ts.Samples {
-			data := map[string]interface{}{
-				"labels":    labelsToMap(ts.Labels),
-				"timestamp": sample.Timestamp,
-				"value":     sample.Value,
+			data := Sample{
+				labels:    labelsToMap(ts.Labels),
+				timestamp: sample.Timestamp,
+				value:     sample.Value,
 			}
 			metrics[metricName] = append(metrics[metricName], data)
 		}
@@ -62,27 +75,63 @@ func (s *S3Store) Write(ctx context.Context, req *prompb.WriteRequest) error {
 			continue
 		}
 
-		jsonData, err := json.Marshal(samples)
+		// Create Arrow schema
+		schema := arrow.NewSchema(
+			[]arrow.Field{
+				{Name: "timestamp", Type: arrow.PrimitiveTypes.Int64},
+				{Name: "value", Type: arrow.PrimitiveTypes.Float64},
+				{Name: "labels", Type: arrow.BinaryTypes.String},
+			},
+			nil,
+		)
+
+		// Build Arrow record
+		pool := memory.NewGoAllocator()
+		builder := array.NewRecordBuilder(pool, schema)
+		defer builder.Release()
+
+		for _, sample := range samples {
+			builder.Field(0).(*array.Int64Builder).Append(sample.timestamp)
+			builder.Field(1).(*array.Float64Builder).Append(sample.value)
+
+			// Serialize labels as JSON string
+			labelsStr := labelsMapToString(sample.labels)
+			builder.Field(2).(*array.StringBuilder).Append(labelsStr)
+		}
+
+		record := builder.NewRecord()
+		defer record.Release()
+
+		// Write to Parquet
+		buf := new(bytes.Buffer)
+		writer, err := pqarrow.NewFileWriter(schema, buf, parquet.NewWriterProperties(), pqarrow.DefaultWriterProps())
 		if err != nil {
-			return fmt.Errorf("failed to marshal data for metric %s: %w", metricName, err)
+			return fmt.Errorf("failed to create parquet writer for metric %s: %w", metricName, err)
+		}
+
+		if err := writer.Write(record); err != nil {
+			writer.Close()
+			return fmt.Errorf("failed to write record to parquet for metric %s: %w", metricName, err)
+		}
+
+		if err := writer.Close(); err != nil {
+			return fmt.Errorf("failed to close parquet writer for metric %s: %w", metricName, err)
 		}
 
 		// Use the timestamp of the first sample for the key.
-		// In a real-world scenario, you might want a more sophisticated naming scheme
-		// to avoid collisions and allow for efficient querying.
-		firstTimestamp := samples[0]["timestamp"].(int64)
+		firstTimestamp := samples[0].timestamp
 		timestamp := time.UnixMilli(firstTimestamp)
-		key := fmt.Sprintf("metrics/%s/%s_%d.json",
+		key := fmt.Sprintf("metrics/%s/%s_%d.parquet",
 			sanitizeMetricName(metricName),
-			timestamp.Format("2006/01/02/15/04/05"), // Added seconds for more granular files
+			timestamp.Format("2006/01/02/15/04/05"),
 			firstTimestamp,
 		)
 
 		_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:      aws.String(s.bucket),
 			Key:         aws.String(key),
-			Body:        strings.NewReader(string(jsonData)),
-			ContentType: aws.String("application/json"),
+			Body:        bytes.NewReader(buf.Bytes()),
+			ContentType: aws.String("application/octet-stream"),
 		})
 		if err != nil {
 			return fmt.Errorf("failed to write batch for metric %s to S3: %w", metricName, err)
@@ -165,49 +214,86 @@ func (s *S3Store) executeQuery(ctx context.Context, query *prompb.Query) (*promp
 				continue
 			}
 
-			var data map[string]interface{}
-			if err := json.NewDecoder(result.Body).Decode(&data); err != nil {
-				log.Printf("Error decoding object %s: %v", *obj.Key, err)
-				result.Body.Close()
-				continue
-			}
+			// Read Parquet file from S3
+			data, err := io.ReadAll(result.Body)
 			result.Body.Close()
-
-			timestamp := int64(data["timestamp"].(float64))
-			value := data["value"].(float64)
-
-			// Filter by time range
-			if timestamp < query.StartTimestampMs || timestamp > query.EndTimestampMs {
+			if err != nil {
+				log.Printf("Error reading object %s: %v", *obj.Key, err)
 				continue
 			}
 
-			// Convert labels back
-			labelsMap := data["labels"].(map[string]interface{})
-			labels := make([]prompb.Label, 0, len(labelsMap))
-			labelKey := ""
-			for name, val := range labelsMap {
-				labels = append(labels, prompb.Label{
-					Name:  name,
-					Value: val.(string),
-				})
-				labelKey += name + "=" + val.(string) + ","
+			// Parse Parquet file
+			parquetReader, err := file.NewParquetReader(bytes.NewReader(data), file.WithReadProps(parquet.NewReaderProperties(memory.DefaultAllocator)))
+			if err != nil {
+				log.Printf("Error creating parquet reader for %s: %v", *obj.Key, err)
+				continue
 			}
 
-			// Group samples by label set
-			ts, exists := timeseriesMap[labelKey]
-			if !exists {
-				ts = &prompb.TimeSeries{
-					Labels:  labels,
-					Samples: []prompb.Sample{},
+			fileReader, err := pqarrow.NewFileReader(parquetReader, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+			if err != nil {
+				log.Printf("Error creating arrow file reader for %s: %v", *obj.Key, err)
+				continue
+			}
+
+			table, err := fileReader.ReadTable(ctx)
+			if err != nil {
+				log.Printf("Error reading parquet table from %s: %v", *obj.Key, err)
+				continue
+			}
+			defer table.Release()
+
+			// Process records
+			tr := array.NewTableReader(table, 0)
+			defer tr.Release()
+
+			for tr.Next() {
+				rec := tr.Record()
+
+				timestampCol := rec.Column(0).(*array.Int64)
+				valueCol := rec.Column(1).(*array.Float64)
+				labelsCol := rec.Column(2).(*array.String)
+
+				for i := 0; i < int(rec.NumRows()); i++ {
+					timestamp := timestampCol.Value(i)
+					value := valueCol.Value(i)
+					labelsStr := labelsCol.Value(i)
+
+					// Filter by time range
+					if timestamp < query.StartTimestampMs || timestamp > query.EndTimestampMs {
+						continue
+					}
+
+					// Parse labels from string
+					labels := stringToLabelsMap(labelsStr)
+
+					// Convert labels back to prompb format
+					pbLabels := make([]prompb.Label, 0, len(labels))
+					labelKey := ""
+					for name, val := range labels {
+						pbLabels = append(pbLabels, prompb.Label{
+							Name:  name,
+							Value: val,
+						})
+						labelKey += name + "=" + val + ","
+					}
+
+					// Group samples by label set
+					ts, exists := timeseriesMap[labelKey]
+					if !exists {
+						ts = &prompb.TimeSeries{
+							Labels:  pbLabels,
+							Samples: []prompb.Sample{},
+						}
+						timeseriesMap[labelKey] = ts
+						timeseries = append(timeseries, ts)
+					}
+
+					ts.Samples = append(ts.Samples, prompb.Sample{
+						Timestamp: timestamp,
+						Value:     value,
+					})
 				}
-				timeseriesMap[labelKey] = ts
-				timeseries = append(timeseries, ts)
 			}
-
-			ts.Samples = append(ts.Samples, prompb.Sample{
-				Timestamp: timestamp,
-				Value:     value,
-			})
 		}
 	}
 
@@ -244,4 +330,22 @@ func sanitizeMetricName(name string) string {
 		" ", "_",
 	)
 	return replacer.Replace(name)
+}
+
+// labelsMapToString converts labels map to JSON string for storage
+func labelsMapToString(labels map[string]string) string {
+	data, err := json.Marshal(labels)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+// stringToLabelsMap converts JSON string back to labels map
+func stringToLabelsMap(s string) map[string]string {
+	var labels map[string]string
+	if err := json.Unmarshal([]byte(s), &labels); err != nil {
+		return make(map[string]string)
+	}
+	return labels
 }
