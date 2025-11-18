@@ -1,32 +1,40 @@
-# Prometheus Remote Storage Adapter for S3
+# Prometheus Remote Storage Adapter for S3 🚀
+
+---
+
+> ### ✨ **This project is vibe-coded!**
+> 
+> Expect creative solutions, experimental features, and a focus on vibes over rigorous production standards. Built with AI assistance and good energy! 🎨
+
+---
 
 A Go application that implements the Prometheus remote storage API using Amazon S3 as the backend storage.
 
-## Features
+## Features ⭐
 
-- **Remote Write**: Store Prometheus metrics in S3
-- **Remote Read**: Query metrics from S3
-- **Time-based organization**: Metrics are organized by name and timestamp for efficient querying
-- **Snappy compression**: Uses Snappy compression for protocol buffer messages
-- **Per-metric manifest indexing**: Maintains `manifest.ndjson` with min/max timestamps to narrow read scans
-- **Concurrent writes with locking**: Per-metric in-process mutex prevents manifest race conditions
+- **📤 Remote Write**: Store Prometheus metrics in S3
+- **📥 Remote Read**: Query metrics from S3
+- **🕒 Time-based organization**: Metrics are organized by name and timestamp for efficient querying
+- **🗜️ Snappy compression**: Uses Snappy compression for protocol buffer messages
+- **📄 Manifest indexing**: Maintains `manifest.ndjson` with min/max timestamps to narrow read scans
+- **🔐 Concurrent writes with locking**: Per-metric in-process mutex prevents manifest race conditions
 
-## Prerequisites
+## Prerequisites ⚙️
 
 - Go 1.25.4 or later
 - AWS credentials configured (via environment variables, AWS credentials file, or IAM role)
 - An S3 bucket
 
-## Installation
+## Installation 🛠️
 
 ```bash
 go mod download
 go build -o prom-store-s3
 ```
 
-## Usage
+## Usage ▶️
 
-### Running the server
+### Running the server 🏃
 
 ```bash
 # Using command-line flags
@@ -38,14 +46,14 @@ export AWS_REGION=us-east-1
 ./prom-store-s3
 ```
 
-### Configuration Options
+### Configuration Options ⚙️
 
 - `-listen-address`: HTTP listen address (default: `:9201`)
 - `-s3-bucket`: S3 bucket name (required, can also use `S3_BUCKET` env var)
 - `-s3-region`: AWS region (default: `us-east-1`, can also use `AWS_REGION` env var)
 - `-log-level`: Structured log level (`debug`, `info`, `warn`, `error`). Defaults to `info`. Can also use `LOG_LEVEL` env var.
 
-### Logging
+### Logging 🧾
 
 The application uses Go's standard library `slog` for structured JSON logging to stdout.
 
@@ -72,7 +80,7 @@ The application uses the AWS SDK's default credential chain:
 2. AWS credentials file (`~/.aws/credentials`)
 3. IAM role (if running on EC2, ECS, or Lambda)
 
-## Prometheus Configuration
+## Prometheus Configuration 📡
 
 Add the following to your `prometheus.yml`:
 
@@ -84,7 +92,7 @@ remote_read:
   - url: "http://localhost:9201/read"
 ```
 
-## Storage Structure
+## Storage Structure 🗂️
 
 Metrics are stored in S3 as Parquet files with the following key structure (note second-level granularity plus original first sample timestamp suffix):
 ```
@@ -101,7 +109,7 @@ Each Parquet file contains an Arrow table with columns:
 - `value`: float64 (metric value)
 - `labels`: string (JSON-encoded map of label names to values)
 
-### Manifest Index
+### Manifest Index 🗃️
 
 For each metric a `manifest.ndjson` file is maintained at:
 ```
@@ -113,17 +121,17 @@ Each line is a JSON object:
 ```
 Reads first attempt to filter candidate parquet objects by intersecting requested time range with `min_ts` / `max_ts`. If manifest is missing or partially unreadable, the code falls back to listing all objects under the metric prefix.
 
-## Retention & Lifecycle Management
+## Retention & Lifecycle Management ♻️
 
 Retention deletion is not performed by this application. Configure S3 Lifecycle rules externally if you need automatic expiry.
 
-## API Endpoints
+## API Endpoints 🔌
 
 - `POST /write`: Prometheus remote write endpoint
 - `POST /read`: Prometheus remote read endpoint
 - `GET /health`: Health check endpoint
 
-## Development
+## Development 👨‍💻
 
 ### Build
 ```bash
@@ -135,7 +143,7 @@ go build
 go run .
 ```
 
-## Limitations & Next Steps
+## Limitations & Next Steps 🚧
 
 This implementation is suitable for experimentation and small-scale use. For production consider:
 
@@ -149,6 +157,6 @@ This implementation is suitable for experimentation and small-scale use. For pro
 - External retention only: rely on S3 lifecycle rules configured outside the application
 - Cold storage tier transitions / lifecycle policies for large historical volumes
 
-## License
+## License 📄
 
 MIT
