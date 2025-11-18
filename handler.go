@@ -32,6 +32,11 @@ func (h *Handler) Write(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(compressed) == 0 {
+		http.Error(w, "Empty request body", http.StatusBadRequest)
+		return
+	}
+
 	reqBuf, err := snappy.Decode(nil, compressed)
 	if err != nil {
 		log.Printf("Error decompressing request: %v", err)
@@ -45,6 +50,18 @@ func (h *Handler) Write(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to unmarshal request", http.StatusBadRequest)
 		return
 	}
+
+	if len(req.Timeseries) == 0 {
+		log.Printf("Warning: received write request with no timeseries")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	totalSamples := 0
+	for _, ts := range req.Timeseries {
+		totalSamples += len(ts.Samples)
+	}
+	log.Printf("Writing %d timeseries with total %d samples", len(req.Timeseries), totalSamples)
 
 	if err := h.store.Write(r.Context(), &req); err != nil {
 		log.Printf("Error writing to S3: %v", err)

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
@@ -38,7 +41,23 @@ func main() {
 
 	log.Printf("Starting Prometheus remote storage adapter on %s", *listenAddr)
 	log.Printf("Using S3 bucket: %s in region: %s", *s3Bucket, *s3Region)
-	if err := http.ListenAndServe(*listenAddr, nil); err != nil {
+	server := &http.Server{
+		Addr:    *listenAddr,
+		Handler: nil, // Uses default mux
+	}
+
+	// Graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		log.Println("Shutting down server...")
+		if err := server.Shutdown(context.Background()); err != nil {
+			log.Printf("Server shutdown error: %v", err)
+		}
+	}()
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }

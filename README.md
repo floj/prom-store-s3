@@ -63,28 +63,20 @@ remote_read:
 
 ## Storage Structure
 
-Metrics are stored in S3 with the following key structure:
+Metrics are stored in S3 as Parquet files with the following key structure:
 ```
-metrics/{metric_name}/{year}/{month}/{day}/{hour}/{minute}/{timestamp}.json
+metrics/{metric_name}/{year}/{month}/{day}/{hour}/{minute}/{timestamp}.parquet
 ```
 
 Example:
 ```
-metrics/http_requests_total/2025/11/18/13/45/1700315100000.json
+metrics/http_requests_total/2025/11/18/13/45/1700315100000.parquet
 ```
 
-Each JSON file contains:
-```json
-{
-  "labels": {
-    "__name__": "http_requests_total",
-    "method": "GET",
-    "status": "200"
-  },
-  "timestamp": 1700315100000,
-  "value": 42.0
-}
-```
+Each Parquet file contains an Arrow table with columns:
+- `timestamp`: int64 (Unix timestamp in milliseconds)
+- `value`: float64 (metric value)
+- `labels`: string (JSON-encoded map of label names to values)
 
 ## API Endpoints
 

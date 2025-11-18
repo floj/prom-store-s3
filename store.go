@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow/go/v18/arrow"
@@ -25,6 +26,12 @@ import (
 type S3Store struct {
 	client *s3.Client
 	bucket string
+}
+
+type Sample struct {
+	labels    map[string]string
+	timestamp int64
+	value     float64
 }
 
 func NewS3Store(bucket, region string) (*S3Store, error) {
@@ -47,11 +54,6 @@ func NewS3Store(bucket, region string) (*S3Store, error) {
 // name from a single WriteRequest into one S3 object.
 func (s *S3Store) Write(ctx context.Context, req *prompb.WriteRequest) error {
 	// Group samples by metric name
-	type Sample struct {
-		labels    map[string]string
-		timestamp int64
-		value     float64
-	}
 	metrics := make(map[string][]Sample)
 
 	for _, ts := range req.Timeseries {
@@ -70,72 +72,30 @@ func (s *S3Store) Write(ctx context.Context, req *prompb.WriteRequest) error {
 		}
 	}
 
+	// Write metrics concurrently
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(metrics))
+
 	for metricName, samples := range metrics {
 		if len(samples) == 0 {
 			continue
 		}
 
-		// Create Arrow schema
-		schema := arrow.NewSchema(
-			[]arrow.Field{
-				{Name: "timestamp", Type: arrow.PrimitiveTypes.Int64},
-				{Name: "value", Type: arrow.PrimitiveTypes.Float64},
-				{Name: "labels", Type: arrow.BinaryTypes.String},
-			},
-			nil,
-		)
+		wg.Add(1)
+		go func(name string, data []Sample) {
+			defer wg.Done()
+			if err := s.writeMetricBatch(ctx, name, data); err != nil {
+				errChan <- err
+			}
+		}(metricName, samples)
+	}
 
-		// Build Arrow record
-		pool := memory.NewGoAllocator()
-		builder := array.NewRecordBuilder(pool, schema)
-		defer builder.Release()
+	wg.Wait()
+	close(errChan)
 
-		for _, sample := range samples {
-			builder.Field(0).(*array.Int64Builder).Append(sample.timestamp)
-			builder.Field(1).(*array.Float64Builder).Append(sample.value)
-
-			// Serialize labels as JSON string
-			labelsStr := labelsMapToString(sample.labels)
-			builder.Field(2).(*array.StringBuilder).Append(labelsStr)
-		}
-
-		record := builder.NewRecord()
-		defer record.Release()
-
-		// Write to Parquet
-		buf := new(bytes.Buffer)
-		writer, err := pqarrow.NewFileWriter(schema, buf, parquet.NewWriterProperties(), pqarrow.DefaultWriterProps())
-		if err != nil {
-			return fmt.Errorf("failed to create parquet writer for metric %s: %w", metricName, err)
-		}
-
-		if err := writer.Write(record); err != nil {
-			writer.Close()
-			return fmt.Errorf("failed to write record to parquet for metric %s: %w", metricName, err)
-		}
-
-		if err := writer.Close(); err != nil {
-			return fmt.Errorf("failed to close parquet writer for metric %s: %w", metricName, err)
-		}
-
-		// Use the timestamp of the first sample for the key.
-		firstTimestamp := samples[0].timestamp
-		timestamp := time.UnixMilli(firstTimestamp)
-		key := fmt.Sprintf("metrics/%s/%s_%d.parquet",
-			sanitizeMetricName(metricName),
-			timestamp.Format("2006/01/02/15/04/05"),
-			firstTimestamp,
-		)
-
-		_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:      aws.String(s.bucket),
-			Key:         aws.String(key),
-			Body:        bytes.NewReader(buf.Bytes()),
-			ContentType: aws.String("application/octet-stream"),
-		})
-		if err != nil {
-			return fmt.Errorf("failed to write batch for metric %s to S3: %w", metricName, err)
-		}
+	// Check for errors
+	if err := <-errChan; err != nil {
+		return err
 	}
 
 	return nil
@@ -165,10 +125,12 @@ func (s *S3Store) Read(ctx context.Context, req *prompb.ReadRequest) (*prompb.Re
 func (s *S3Store) executeQuery(ctx context.Context, query *prompb.Query) (*prompb.QueryResult, error) {
 	// Extract metric name from matchers
 	metricName := ""
+	labelMatchers := make(map[string]*prompb.LabelMatcher)
 	for _, matcher := range query.Matchers {
 		if matcher.Name == "__name__" && matcher.Type == prompb.LabelMatcher_EQ {
 			metricName = matcher.Value
-			break
+		} else {
+			labelMatchers[matcher.Name] = matcher
 		}
 	}
 
@@ -266,6 +228,11 @@ func (s *S3Store) executeQuery(ctx context.Context, query *prompb.Query) (*promp
 					// Parse labels from string
 					labels := stringToLabelsMap(labelsStr)
 
+					// Filter by label matchers
+					if !matchesLabels(labels, labelMatchers) {
+						continue
+					}
+
 					// Convert labels back to prompb format
 					pbLabels := make([]prompb.Label, 0, len(labels))
 					labelKey := ""
@@ -348,4 +315,98 @@ func stringToLabelsMap(s string) map[string]string {
 		return make(map[string]string)
 	}
 	return labels
+}
+
+// matchesLabels checks if the given labels match all the provided matchers
+func matchesLabels(labels map[string]string, matchers map[string]*prompb.LabelMatcher) bool {
+	for name, matcher := range matchers {
+		value, exists := labels[name]
+		switch matcher.Type {
+		case prompb.LabelMatcher_EQ:
+			if !exists || value != matcher.Value {
+				return false
+			}
+		case prompb.LabelMatcher_NEQ:
+			if exists && value == matcher.Value {
+				return false
+			}
+		case prompb.LabelMatcher_RE:
+			// For simplicity, treat RE as EQ (full regex support would require regexp package)
+			if !exists || value != matcher.Value {
+				return false
+			}
+		case prompb.LabelMatcher_NRE:
+			if exists && value == matcher.Value {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// writeMetricBatch writes a batch of samples for a single metric to S3
+func (s *S3Store) writeMetricBatch(ctx context.Context, metricName string, samples []Sample) error {
+	// Create Arrow schema
+	schema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "timestamp", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "value", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "labels", Type: arrow.BinaryTypes.String},
+		},
+		nil,
+	)
+
+	// Build Arrow record
+	pool := memory.NewGoAllocator()
+	builder := array.NewRecordBuilder(pool, schema)
+	defer builder.Release()
+
+	for _, sample := range samples {
+		builder.Field(0).(*array.Int64Builder).Append(sample.timestamp)
+		builder.Field(1).(*array.Float64Builder).Append(sample.value)
+
+		// Serialize labels as JSON string
+		labelsStr := labelsMapToString(sample.labels)
+		builder.Field(2).(*array.StringBuilder).Append(labelsStr)
+	}
+
+	record := builder.NewRecord()
+	defer record.Release()
+
+	// Write to Parquet
+	buf := new(bytes.Buffer)
+	writer, err := pqarrow.NewFileWriter(schema, buf, parquet.NewWriterProperties(), pqarrow.DefaultWriterProps())
+	if err != nil {
+		return fmt.Errorf("failed to create parquet writer for metric %s: %w", metricName, err)
+	}
+
+	if err := writer.Write(record); err != nil {
+		writer.Close()
+		return fmt.Errorf("failed to write record to parquet for metric %s: %w", metricName, err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to close parquet writer for metric %s: %w", metricName, err)
+	}
+
+	// Use the timestamp of the first sample for the key.
+	firstTimestamp := samples[0].timestamp
+	timestamp := time.UnixMilli(firstTimestamp)
+	key := fmt.Sprintf("metrics/%s/%s_%d.parquet",
+		sanitizeMetricName(metricName),
+		timestamp.Format("2006/01/02/15/04/05"),
+		firstTimestamp,
+	)
+
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(buf.Bytes()),
+		ContentType: aws.String("application/octet-stream"),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to write batch for metric %s to S3: %w", metricName, err)
+	}
+
+	return nil
 }
