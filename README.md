@@ -8,7 +8,6 @@ A Go application that implements the Prometheus remote storage API using Amazon 
 - **Remote Read**: Query metrics from S3
 - **Time-based organization**: Metrics are organized by name and timestamp for efficient querying
 - **Snappy compression**: Uses Snappy compression for protocol buffer messages
-- **Retention cleanup**: Hourly scan deletes objects older than configured retention period
 - **Per-metric manifest indexing**: Maintains `manifest.ndjson` with min/max timestamps to narrow read scans
 - **Concurrent writes with locking**: Per-metric in-process mutex prevents manifest race conditions
 
@@ -31,12 +30,11 @@ go build -o prom-store-s3
 
 ```bash
 # Using command-line flags
-./prom-store-s3 -s3-bucket=my-prometheus-bucket -s3-region=us-east-1 -listen-address=:9201 -retention-days=7
+./prom-store-s3 -s3-bucket=my-prometheus-bucket -s3-region=us-east-1 -listen-address=:9201
 
 # Using environment variables
 export S3_BUCKET=my-prometheus-bucket
 export AWS_REGION=us-east-1
-export RETENTION_DAYS=7
 ./prom-store-s3
 ```
 
@@ -45,7 +43,6 @@ export RETENTION_DAYS=7
 - `-listen-address`: HTTP listen address (default: `:9201`)
 - `-s3-bucket`: S3 bucket name (required, can also use `S3_BUCKET` env var)
 - `-s3-region`: AWS region (default: `us-east-1`, can also use `AWS_REGION` env var)
-- `-retention-days`: Data retention period in days (default: `7`, can also use `RETENTION_DAYS` env var)
 - `-log-level`: Structured log level (`debug`, `info`, `warn`, `error`). Defaults to `info`. Can also use `LOG_LEVEL` env var.
 
 ### Logging
@@ -61,9 +58,9 @@ export LOG_LEVEL=warn
 ./prom-store-s3
 ```
 
-Example log entry:
+Example log entry (fields may vary):
 ```json
-{"time":"2025-11-18T12:00:00Z","level":"INFO","msg":"starting prometheus remote storage adapter","listen_address":":9201","s3_bucket":"my-prometheus-bucket","s3_region":"us-east-1","retention_days":7,"log_level":"INFO"}
+{"time":"2025-11-18T12:00:00Z","level":"INFO","msg":"starting prometheus remote storage adapter","listen_address":":9201","s3_bucket":"my-prometheus-bucket","s3_region":"us-east-1","log_level":"INFO"}
 ```
 
 All operations (writes, reads, retention cleanup, errors) emit structured fields for easier ingestion by log processors.
@@ -118,32 +115,7 @@ Reads first attempt to filter candidate parquet objects by intersecting requeste
 
 ## Retention & Lifecycle Management
 
-Two modes are available:
-
-1. Internal deletion (default): An hourly goroutine lists objects and deletes those older than the configured `-retention-days` using LastModified timestamps.
-2. S3 Lifecycle mode (`-use-s3-lifecycle`): Internal deletion is disabled. Each written object is tagged with:
-   ```
-   prom-retention-expiry=YYYY-MM-DD
-   ```
-   The date is computed as (max sample timestamp + retention period) in UTC. Configure an S3 Lifecycle rule to expire objects matching this tag on or after that date.
-
-### Example Lifecycle Rule (JSON snippet)
-```json
-{
-  "Rules": [
-    {
-      "ID": "PromMetricsExpiry",
-      "Status": "Enabled",
-      "Filter": {"Tag": {"Key": "prom-retention-expiry", "Value": "*"}},
-      "Expiration": {"ExpiredObjectDeleteMarker": false},
-      "NoncurrentVersionExpiration": {"NoncurrentDays": 30}
-    }
-  ]
-}
-```
-Note: AWS Lifecycle does not support wildcard tag values directly in JSON; you typically scope by tag key regardless of value. You can alternatively filter by prefix and use the tag for auditing.
-
-When running multiple replicas, prefer lifecycle mode to avoid race conditions or redundant delete operations.
+Retention deletion is not performed by this application. Configure S3 Lifecycle rules externally if you need automatic expiry.
 
 ## API Endpoints
 
@@ -169,12 +141,12 @@ This implementation is suitable for experimentation and small-scale use. For pro
 
 - Distributed manifest consistency: Current locking prevents races only within a single process. Multiple replica deployments could still race on manifest updates (use S3 object versioning, DynamoDB, or atomic append pattern).
 - Bounding parallel write goroutines (add a worker pool / semaphore)
-- Exposing Prometheus metrics (write/read latency, S3 ops, retention deletions)
+- Exposing Prometheus metrics (write/read latency, S3 ops)
 - Adding authentication / authorization (e.g. mTLS or reverse proxy integration)
 - Improved regex matcher support (full RE / NRE semantics)
 - Configurable Parquet row group / compression tuning
 - Pluggable storage class selection (STANDARD vs GLACIER tiers)
-- Retention currently uses S3 object LastModified; consider tagging + lifecycle rules for offloading work to S3
+- External retention only: rely on S3 lifecycle rules configured outside the application
 - Cold storage tier transitions / lifecycle policies for large historical volumes
 
 ## License
