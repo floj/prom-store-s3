@@ -116,6 +116,35 @@ Each line is a JSON object:
 ```
 Reads first attempt to filter candidate parquet objects by intersecting requested time range with `min_ts` / `max_ts`. If manifest is missing or partially unreadable, the code falls back to listing all objects under the metric prefix.
 
+## Retention & Lifecycle Management
+
+Two modes are available:
+
+1. Internal deletion (default): An hourly goroutine lists objects and deletes those older than the configured `-retention-days` using LastModified timestamps.
+2. S3 Lifecycle mode (`-use-s3-lifecycle`): Internal deletion is disabled. Each written object is tagged with:
+   ```
+   prom-retention-expiry=YYYY-MM-DD
+   ```
+   The date is computed as (max sample timestamp + retention period) in UTC. Configure an S3 Lifecycle rule to expire objects matching this tag on or after that date.
+
+### Example Lifecycle Rule (JSON snippet)
+```json
+{
+  "Rules": [
+    {
+      "ID": "PromMetricsExpiry",
+      "Status": "Enabled",
+      "Filter": {"Tag": {"Key": "prom-retention-expiry", "Value": "*"}},
+      "Expiration": {"ExpiredObjectDeleteMarker": false},
+      "NoncurrentVersionExpiration": {"NoncurrentDays": 30}
+    }
+  ]
+}
+```
+Note: AWS Lifecycle does not support wildcard tag values directly in JSON; you typically scope by tag key regardless of value. You can alternatively filter by prefix and use the tag for auditing.
+
+When running multiple replicas, prefer lifecycle mode to avoid race conditions or redundant delete operations.
+
 ## API Endpoints
 
 - `POST /write`: Prometheus remote write endpoint

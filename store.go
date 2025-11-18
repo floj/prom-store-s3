@@ -21,19 +21,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/prometheus/prometheus/prompb"
 )
 
 type S3Store struct {
-	client          *s3.Client
-	bucket          string
-	retentionPeriod time.Duration
-	retentionCancel context.CancelFunc
-	retentionWG     sync.WaitGroup
-	logger          *slog.Logger
-	mapMutex        sync.Mutex
-	manifestLocks   map[string]*sync.Mutex
+	client        *s3.Client
+	bucket        string
+	logger        *slog.Logger
+	mapMutex      sync.Mutex
+	manifestLocks map[string]*sync.Mutex
 }
 
 type Sample struct {
@@ -50,7 +46,7 @@ type ManifestEntry struct {
 	Samples int    `json:"samples"`
 }
 
-func NewS3Store(bucket, region string, retentionPeriod time.Duration, logger *slog.Logger) (*S3Store, error) {
+func NewS3Store(bucket, region string, logger *slog.Logger) (*S3Store, error) {
 	cfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion(region),
 	)
@@ -61,11 +57,10 @@ func NewS3Store(bucket, region string, retentionPeriod time.Duration, logger *sl
 	client := s3.NewFromConfig(cfg)
 
 	return &S3Store{
-		client:          client,
-		bucket:          bucket,
-		retentionPeriod: retentionPeriod,
-		logger:          logger,
-		manifestLocks:   make(map[string]*sync.Mutex),
+		client:        client,
+		bucket:        bucket,
+		logger:        logger,
+		manifestLocks: make(map[string]*sync.Mutex),
 	}, nil
 }
 
@@ -339,103 +334,7 @@ func matchesLabels(labels map[string]string, matchers map[string]*prompb.LabelMa
 	return true
 }
 
-// StartRetentionCleanup starts a background goroutine that periodically cleans up old data
-func (s *S3Store) StartRetentionCleanup() {
-	if s.retentionPeriod <= 0 {
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	s.retentionCancel = cancel
-	s.retentionWG.Add(1)
-	go func() {
-		defer s.retentionWG.Done()
-		ticker := time.NewTicker(time.Hour)
-		defer ticker.Stop()
-		s.logger.Info("starting retention cleanup", "period", s.retentionPeriod)
-		for {
-			select {
-			case <-ctx.Done():
-				s.logger.Info("stopping retention cleanup")
-				return
-			case <-ticker.C:
-				if err := s.cleanupOldData(ctx); err != nil {
-					s.logger.Error("retention cleanup error", "error", err)
-				}
-			}
-		}
-	}()
-}
-
-func (s *S3Store) Stop() {
-	if s.retentionCancel != nil {
-		s.retentionCancel()
-	}
-	s.retentionWG.Wait()
-}
-
-// cleanupOldData removes data older than the retention period
-func (s *S3Store) cleanupOldData(ctx context.Context) error {
-	cutoffTime := time.Now().Add(-s.retentionPeriod)
-	s.logger.Info("retention cleanup scanning", "cutoff", cutoffTime)
-
-	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.bucket),
-		Prefix: aws.String("metrics/"),
-	})
-
-	var objectsToDelete []string
-
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to list S3 objects: %w", err)
-		}
-
-		for _, obj := range page.Contents {
-			if obj.LastModified == nil {
-				continue
-			}
-			if obj.LastModified.Before(cutoffTime) {
-				objectsToDelete = append(objectsToDelete, *obj.Key)
-			}
-		}
-	}
-
-	if len(objectsToDelete) == 0 {
-		return nil
-	}
-
-	const batchSize = 1000
-	for i := 0; i < len(objectsToDelete); i += batchSize {
-		end := i + batchSize
-		if end > len(objectsToDelete) {
-			end = len(objectsToDelete)
-		}
-		if err := s.deleteObjectsBatch(ctx, objectsToDelete[i:end]); err != nil {
-			return fmt.Errorf("failed to delete batch: %w", err)
-		}
-	}
-
-	s.logger.Info("retention cleanup deleted objects", "count", len(objectsToDelete))
-	return nil
-}
-
-// deleteObjectsBatch deletes a batch of objects from S3
-func (s *S3Store) deleteObjectsBatch(ctx context.Context, keys []string) error {
-	objects := make([]types.ObjectIdentifier, len(keys))
-	for i, key := range keys {
-		objects[i] = types.ObjectIdentifier{Key: aws.String(key)}
-	}
-
-	_, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String(s.bucket),
-		Delete: &types.Delete{
-			Objects: objects,
-		},
-	})
-
-	return err
-}
+// Retention cleanup functionality removed. Objects are retained indefinitely unless external lifecycle rules are applied.
 
 // writeMetricBatch writes a batch of samples for a single metric to S3
 func (s *S3Store) writeMetricBatch(ctx context.Context, metricName string, samples []Sample) error {

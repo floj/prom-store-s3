@@ -24,11 +24,10 @@ func getEnvInt(key string, defaultValue int) int {
 
 func main() {
 	var (
-		listenAddr    = flag.String("listen-address", ":9201", "Address to listen on for HTTP requests")
-		s3Bucket      = flag.String("s3-bucket", os.Getenv("S3_BUCKET"), "S3 bucket name")
-		s3Region      = flag.String("s3-region", os.Getenv("AWS_REGION"), "AWS region")
-		retentionDays = flag.Int("retention-days", getEnvInt("RETENTION_DAYS", 7), "Data retention period in days (default 7)")
-		logLevelFlag  = flag.String("log-level", os.Getenv("LOG_LEVEL"), "Log level (debug, info, warn, error). Can also use LOG_LEVEL env var")
+		listenAddr   = flag.String("listen-address", ":9201", "Address to listen on for HTTP requests")
+		s3Bucket     = flag.String("s3-bucket", os.Getenv("S3_BUCKET"), "S3 bucket name")
+		s3Region     = flag.String("s3-region", os.Getenv("AWS_REGION"), "AWS region")
+		logLevelFlag = flag.String("log-level", os.Getenv("LOG_LEVEL"), "Log level (debug, info, warn, error). Can also use LOG_LEVEL env var")
 	)
 	flag.Parse()
 
@@ -52,14 +51,11 @@ func main() {
 		*s3Region = "us-east-1"
 	}
 
-	store, err := NewS3Store(*s3Bucket, *s3Region, time.Duration(*retentionDays*24)*time.Hour, logger)
+	store, err := NewS3Store(*s3Bucket, *s3Region, logger)
 	if err != nil {
 		logger.Error("failed to create S3 store", "error", err)
 		os.Exit(1)
 	}
-
-	// Start retention cleanup goroutine (managed internally)
-	store.StartRetentionCleanup()
 
 	handler := NewHandler(store, logger)
 
@@ -70,7 +66,7 @@ func main() {
 		w.Write([]byte("OK"))
 	})
 
-	logger.Info("starting prometheus remote storage adapter", "listen_address", *listenAddr, "s3_bucket", *s3Bucket, "s3_region", *s3Region, "retention_days", *retentionDays, "log_level", level.String())
+	logger.Info("starting prometheus remote storage adapter", "listen_address", *listenAddr, "s3_bucket", *s3Bucket, "s3_region", *s3Region, "log_level", level.String())
 	server := &http.Server{
 		Addr:    *listenAddr,
 		Handler: nil, // Uses default mux
@@ -82,8 +78,6 @@ func main() {
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
 		logger.Info("received shutdown signal, initiating graceful shutdown")
-		// Stop background processes
-		store.Stop()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
